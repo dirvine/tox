@@ -88,7 +88,7 @@ impl Decoder for DhtCodec {
 
         match DhtPacket::from_bytes(buf) {
             IResult::Incomplete(needed) => Err(DecodeError::IncompletePacket { len, needed }.into()),
-            IResult::Error(error) => Err(DecodeError::DeserializeError { error }.into()),
+            IResult::Error(error) => Err(DecodeError::DeserializeError { error: error.into_error_kind() }.into()),
             IResult::Done(_, packet) => Ok(Some(packet))
         }
     }
