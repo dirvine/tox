@@ -4,6 +4,7 @@
 use toxcore::crypto_core::*;
 use toxcore::onion::packet::InnerOnionResponse;
 use toxcore::tcp::server::client::Client;
+use toxcore::tcp::server::links::*;
 use toxcore::tcp::packet::*;
 use toxcore::io_tokio::IoFuture;
 
@@ -105,32 +106,39 @@ impl Server {
     /** Actual shutdown is done here.
     */
     fn shutdown_client_inner(&self, pk: &PublicKey, state: &mut ServerState) -> IoFuture<()> {
-        let client_a = if let Some(client_a) = state.connected_clients.remove(pk) {
-            client_a
+        // remove client by pk from connected_clients
+        let client_a = if let Some(client) = state.connected_clients.remove(pk) {
+            client
         } else {
             return Box::new(future::err(
                 Error::new(ErrorKind::Other,
                            "Cannot find client by pk to shutdown it"
                 )))
         };
+
         state.keys_by_addr.remove(&(client_a.ip_addr(), client_a.port()));
-        let notifications = client_a.iter_links()
-            // foreach link that is Some(client_b_pk)
-            .filter_map(|&client_b_pk| client_b_pk)
-            .map(|client_b_pk| {
-                if let Some(client_b) = state.connected_clients.get_mut(&client_b_pk) {
-                    // check if client_a is linked in client_b
-                    if let Some(a_id_in_client_b) = client_b.get_connection_id(pk) {
-                        // it is linked, we should notify client_b
-                        // link from client_b.links should not be removed
-                        client_b.send_disconnect_notification(a_id_in_client_b)
-                    } else {
+        let links = client_a.links();
+        let notifications = links.iter_links()
+            // foreach link that is Some(Link)
+            .filter_map(|&link| link)
+            .map(|link| {
+                match link.status {
+                    LinkStatus::Registered => {
                         // Current client is not linked in client_b
                         Box::new(future::ok(()))
+                    },
+                    LinkStatus::Online(a_id_in_client_b) => {
+                        let client_b_pk = link.pk;
+                        if let Some(client_b) = state.connected_clients.get(&client_b_pk) {
+                            // they are linked, we should notify client_b
+                            // link from client_b.links should be downgraded
+                            client_b.links().downgrade(a_id_in_client_b);
+                            client_b.send_disconnect_notification(a_id_in_client_b + 16)
+                        } else  {
+                            // client_b is not connected to the server
+                            Box::new(future::ok(()))
+                        }
                     }
-                } else {
-                    // client_b is not connected to the server
-                    Box::new(future::ok(()))
                 }
             });
         Box::new(stream::futures_unordered(notifications).for_each(Ok))
@@ -138,55 +146,75 @@ impl Server {
     // Here start the impl of `handle_***` methods
 
     fn handle_route_request(&self, pk: &PublicKey, packet: &RouteRequest) -> IoFuture<()> {
-        let mut state = self.state.write();
+        let state = self.state.read();
+
+        // get client_a
+        let client_a = if let Some(client) = state.connected_clients.get(pk) {
+            client
+        } else {
+            return Box::new(future::err(
+                Error::new(ErrorKind::Other,
+                           "RouteRequest: no such PK"
+                )))
+        };
+
+        if pk == &packet.pk {
+            // send RouteResponse(0) if client requests its own pk
+            return client_a.send_route_response(pk, 0)
+        }
+
         let b_id_in_client_a = {
-            // check if client was already linked to pk
-            if let Some(client_a) = state.connected_clients.get_mut(pk) {
-                if pk == &packet.pk {
-                    // send RouteResponse(0) if client requests its own pk
-                    return client_a.send_route_response(pk, 0)
-                }
-                if let Some(b_id_in_client_a) = client_a.get_connection_id(&packet.pk) {
-                    // send RouteResponse if client was already linked to pk
-                    return client_a.send_route_response(&packet.pk, b_id_in_client_a)
-                } else if let Some(b_id_in_client_a) = client_a.insert_connection_id(&packet.pk) {
-                    // new link was inserted into client.links
-                    b_id_in_client_a
-                } else {
-                    // send RouteResponse(0) if no space to insert new link
-                    return client_a.send_route_response(&packet.pk, 0)
-                }
+            // take scoped MutexGuard<Links> to live not short period of time
+            let mut links_a = client_a.links();
+
+            // check if client_a is already linked
+            if let Some(index) = links_a.id_by_pk(&packet.pk) {
+                // send RouteResponse if client was already linked to pk
+                return client_a.send_route_response(&packet.pk, index + 16)
+            }
+
+            // try to insert a new link
+            if let Some(index) = links_a.insert(&packet.pk) {
+                index
             } else {
-                return Box::new(future::err(
-                    Error::new(ErrorKind::Other,
-                               "RouteRequest: no such PK"
-                    )))
+                // send RouteResponse(0) if no space to insert new link
+                return client_a.send_route_response(&packet.pk, 0)
             }
         };
-        let client_a = &state.connected_clients[pk];
-        if let Some(client_b) = state.connected_clients.get(&packet.pk) {
-            // check if current pk is linked inside other_client
-            if let Some(a_id_in_client_b) = client_b.get_connection_id(pk) {
-                // the are both linked, send RouteResponse and
-                // send each other ConnectNotification
-                // we don't care if connect notifications fail
-                let client_a_notification = client_a.send_connect_notification(b_id_in_client_a);
-                let client_b_notification = client_b.send_connect_notification(a_id_in_client_b);
-                return Box::new(
-                    client_a.send_route_response(&packet.pk, b_id_in_client_a)
-                        .join(client_a_notification)
-                        .join(client_b_notification)
-                        .map(|_| ())
-                )
+
+        // get client_b
+        let client_b = if let Some(client) = state.connected_clients.get(&packet.pk) {
+            client
+        } else {
+            // send RouteResponse only to current client
+            return client_a.send_route_response(&packet.pk, b_id_in_client_a + 16)
+        };
+
+        // check if current pk is linked inside other_client
+        let a_id_in_client_b = {
+            if let Some(index) = client_b.links().id_by_pk(&packet.pk) {
+                index
             } else {
                 // they are not linked
                 // send RouteResponse only to current client
-                client_a.send_route_response(&packet.pk, b_id_in_client_a)
+                return client_a.send_route_response(&packet.pk, b_id_in_client_a + 16)
             }
-        } else {
-            // send RouteResponse only to current client
-            client_a.send_route_response(&packet.pk, b_id_in_client_a)
-        }
+        };
+
+        // the are both linked, send RouteResponse and
+        // send each other ConnectNotification
+        // we don't care if connect notifications fail
+        client_a.links().upgrade(b_id_in_client_a, a_id_in_client_b);
+        client_b.links().upgrade(a_id_in_client_b, b_id_in_client_a);
+
+        let client_a_notification = client_a.send_connect_notification(b_id_in_client_a + 16);
+        let client_b_notification = client_b.send_connect_notification(a_id_in_client_b + 16);
+        return Box::new(
+            client_a.send_route_response(&packet.pk, b_id_in_client_a + 16)
+                .join(client_a_notification)
+                .join(client_b_notification)
+                .map(|_| ())
+        )
     }
     fn handle_route_response(&self, _pk: &PublicKey, _packet: &RouteResponse) -> IoFuture<()> {
         Box::new(future::err(
@@ -200,42 +228,51 @@ impl Server {
         Box::new(future::ok(()))
     }
     fn handle_disconnect_notification(&self, pk: &PublicKey, packet: &DisconnectNotification) -> IoFuture<()> {
-        let mut state = self.state.write();
-        let client_b_pk = {
-            if let Some(client_a) = state.connected_clients.get_mut(pk) {
-                // unlink other_pk from client.links if any
-                // and return previous value
-                if let Some(client_b_pk) = client_a.take_link(packet.connection_id) {
-                    client_b_pk
-                } else {
-                    trace!("DisconnectNotification.connection_id is not linked for the client {:?}", pk);
-                    // There is possibility that the first client disconnected but the second client
-                    // haven't received DisconnectNotification yet and have sent yet another packet.
-                    // In this case we don't want to throw an error and force disconnect the second client.
-                    // TODO: failure can be used to return an error and handle it inside ServerProcessor
-                    return Box::new(future::ok(()))
-                }
-            } else {
-                return Box::new( future::err(
-                    Error::new(ErrorKind::Other,
-                        "DisconnectNotification: no such PK"
-                )))
-            }
+        let state = self.state.read();
+
+        // get client_a
+        let client_a = if let Some(client) = state.connected_clients.get(pk) {
+            client
+        } else  {
+            return Box::new( future::err(
+                Error::new(ErrorKind::Other,
+                    "DisconnectNotification: no such PK"
+            )));
         };
 
-        if let Some(client_b) = state.connected_clients.get_mut(&client_b_pk) {
-            if let Some(a_id_in_client_b) = client_b.get_connection_id(pk) {
-                // it is linked, we should notify client_b
-                // link from client_b.links should not be removed
-                client_b.send_disconnect_notification(a_id_in_client_b)
-            } else {
+        // unlink the link from client.links if any
+        let a_link = if let Some(link) = client_a.links().take(packet.connection_id - 16) {
+            link
+        } else {
+            trace!("DisconnectNotification.connection_id is not linked for the client {:?}", pk);
+            // There is possibility that the first client disconnected but the second client
+            // haven't received DisconnectNotification yet and have sent yet another packet.
+            // In this case we don't want to throw an error and force disconnect the second client.
+            // TODO: failure can be used to return an error and handle it inside ServerProcessor
+            return Box::new(future::ok(()))
+        };
+
+        match a_link.status {
+            LinkStatus::Registered => {
                 // Do nothing because
                 // client_b has not sent RouteRequest yet to connect to client_a
                 Box::new( future::ok(()) )
+            },
+            LinkStatus::Online(a_id_in_client_b) => {
+                let client_b_pk = a_link.pk;
+                // get client_b
+                let client_b = if let Some(client) = state.connected_clients.get(&client_b_pk) {
+                    client
+                } else  {
+                    // client_b is not connected to the server
+                    // so ignore DisconnectNotification
+                    return Box::new( future::ok(()) )
+                };
+                // it is linked, we should notify client_b
+                // link from client_b.links should be downgraded
+                client_b.links().downgrade(a_id_in_client_b);
+                client_b.send_disconnect_notification(a_id_in_client_b + 16)
             }
-        } else {
-            // client_b is not connected to the server, so ignore DisconnectNotification
-            Box::new( future::ok(()) )
         }
     }
     fn handle_ping_request(&self, pk: &PublicKey, packet: &PingRequest) -> IoFuture<()> {
@@ -318,7 +355,7 @@ impl Server {
             } else {
                Box::new( future::err(
                    Error::new(ErrorKind::Other,
-                       "PongResponse: no such PK"
+                       "OnionRequest: no such PK"
                )) )
             }
         } else {
@@ -334,36 +371,47 @@ impl Server {
     }
     fn handle_data(&self, pk: &PublicKey, packet: Data) -> IoFuture<()> {
         let state = self.state.read();
-        let client_b_pk = {
-            if let Some(client_a) = state.connected_clients.get(pk) {
-                if let Some(client_b_pk) = client_a.get_link(packet.connection_id) {
-                    client_b_pk
-                } else {
-                    trace!("Data.connection_id is not linked for the client {:?}", pk);
-                    // There is possibility that the first client disconnected but the second client
-                    // haven't received DisconnectNotification yet and have sent yet another packet.
-                    // In this case we don't want to throw an error and force disconnect the second client.
-                    // TODO: failure can be used to return an error and handle it inside ServerProcessor
-                    return Box::new(future::ok(()))
-                }
-            } else {
-                return Box::new( future::err(
-                    Error::new(ErrorKind::Other,
-                        "Data: no such PK"
-                )))
-            }
+
+        // get client_a
+        let client_a = if let Some(client) = state.connected_clients.get(pk) {
+            client
+        } else  {
+            return Box::new( future::err(
+                Error::new(ErrorKind::Other,
+                    "Data: no such PK"
+            )));
         };
-        if let Some(client_b) = state.connected_clients.get(&client_b_pk) {
-            if let Some(a_id_in_client_b) = client_b.get_connection_id(pk) {
-                client_b.send_data(a_id_in_client_b, packet.data)
-            } else {
+
+        // get the link from client.links if any
+        let a_link = if let Some(link) = client_a.links().by_id(packet.connection_id - 16) {
+            link.clone()
+        } else {
+            trace!("Data.connection_id is not linked for the client {:?}", pk);
+            // There is possibility that the first client disconnected but the second client
+            // haven't received DisconnectNotification yet and have sent yet another packet.
+            // In this case we don't want to throw an error and force disconnect the second client.
+            // TODO: failure can be used to return an error and handle it inside ServerProcessor
+            return Box::new(future::ok(()))
+        };
+
+        match a_link.status {
+            LinkStatus::Registered => {
                 // Do nothing because
                 // client_b has not sent RouteRequest yet to connect to client_a
                 Box::new( future::ok(()) )
+            },
+            LinkStatus::Online(a_id_in_client_b) => {
+                let client_b_pk = a_link.pk;
+                // get client_b
+                let client_b = if let Some(client) = state.connected_clients.get(&client_b_pk) {
+                    client
+                } else  {
+                    // Do nothing because client_b is not connected to server
+                    return Box::new( future::ok(()) )
+                };
+                // it is linked, we should send data to client_b
+                client_b.send_data(a_id_in_client_b + 16, packet.data)
             }
-        } else {
-            // Do nothing because client_b is not connected to server
-            Box::new( future::ok(()) )
         }
     }
     /* Remove timedout connected clients

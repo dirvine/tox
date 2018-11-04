@@ -763,7 +763,8 @@ impl Server {
         Box::new(self.ping_add(&PackedNode::new(addr, &packet.pk))
             .join(self.send_to_direct(addr, ping_resp))
             .map(|_| ())
-        )    }
+        )
+    }
 
     /// Handle received `PingResponse` packet and if it's correct add the node
     /// that sent this packet to close nodes lists.

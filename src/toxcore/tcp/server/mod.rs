@@ -4,6 +4,7 @@
 mod client;
 mod server;
 mod server_ext;
+mod links;
 
 pub use self::client::Client;
 pub use self::server::Server;
