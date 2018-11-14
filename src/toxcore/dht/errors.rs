@@ -7,6 +7,8 @@ use std::convert::From;
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
 
+use toxcore::dht::lan_discovery::ServerRunError;
+
 /// Error that can happen when calling `get_payload` of packet.
 #[derive(Debug, Fail)]
 pub enum GetPayloadError {
@@ -41,6 +43,13 @@ pub enum GetPayloadError {
 /// From trait for temporary use during transition from io:Error to custom enum error of failure crate
 impl From<GetPayloadError> for IoError {
     fn from(_item: GetPayloadError) -> Self {
-        IoError::new(IoErrorKind::Other, "GetPayloadError occured.")
+        IoError::new(IoErrorKind::Other, "GetPayloadError occurred.")
+    }
+}
+
+/// From trait for temporary use during transition from io:Error to custom enum error of failure crate
+impl From<ServerRunError> for IoError {
+    fn from(_item: ServerRunError) -> Self {
+        IoError::new(IoErrorKind::Other, "ServerRunError occurred.")
     }
 }

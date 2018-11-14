@@ -1,19 +1,39 @@
 //! Module for LAN discovery.
 
 use std::iter;
-use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
+use std::io::Error as IoError;
 
-use futures::{stream, Stream};
+use futures::{Future, stream, Stream};
 use futures::sync::mpsc;
 use get_if_addrs;
 use get_if_addrs::IfAddr;
 use tokio::timer::Interval;
+use tokio::timer::Error as TimerError;
 
 use toxcore::crypto_core::*;
 use toxcore::io_tokio::*;
 use toxcore::dht::packet::*;
+//use toxcore::errors::*;
+
+/// Error that can happen during server execution
+#[derive(Debug, Fail)]
+pub enum ServerRunError {
+    /// Ping wakeups timer error
+    #[fail(display = "Lan discovery wakeups timer error: {:?}", error)]
+    WakeupsError {
+        /// Timer error
+        error: TimerError
+    },
+    /// Send pings error
+    #[fail(display = "Send packets error: {:?}", error)]
+    SendPacketError {
+        /// Send packets error
+        #[fail(cause)]
+        error: IoError
+    },
+}
 
 /// How many ports should be used on every iteration.
 pub const PORTS_PER_DISCOVERY: u16 = 10;
@@ -110,7 +130,7 @@ impl LanDiscoverySender {
     }
 
     /// Send `LanDiscovery` packets.
-    fn send(&mut self) -> IoFuture<()> {
+    fn send(&mut self) -> impl Future<Item=(), Error=ServerRunError> {
         let addrs = self.get_broadcast_socket_addrs();
         let lan_packet = Packet::LanDiscovery(LanDiscovery {
             pk: self.dht_pk,
@@ -125,16 +145,15 @@ impl LanDiscoverySender {
 
     /// Run LAN discovery periodically. Result future will never be completed
     /// successfully.
-    pub fn run(mut self) -> IoFuture<()> {
+    pub fn run(mut self) -> impl Future<Item=(), Error=ServerRunError> {
         let interval = Duration::from_secs(LAN_DISCOVERY_INTERVAL);
         let wakeups = Interval::new(Instant::now(), interval);
-        let future = wakeups
-            .map_err(|e| Error::new(ErrorKind::Other, format!("LanDiscovery timer error: {:?}", e)))
+        wakeups
+            .map_err(|e| ServerRunError::WakeupsError { error: e })
             .for_each(move |_instant| {
                 trace!("LAN discovery sender wake up");
                 self.send()
-            });
-        Box::new(future)
+            })
     }
 }
 

@@ -5,6 +5,8 @@ use std::io::{Error, ErrorKind};
 
 use futures::{Future, Sink, Stream};
 
+use toxcore::dht::lan_discovery::ServerRunError;
+
 /// A convenience typedef around a `Future` whose error component is `io::Error`
 pub type IoFuture<T> = Box<Future<Item = T, Error = Error> + Send>;
 
@@ -29,11 +31,11 @@ pub fn send_to<T: Send + 'static, Tx, E: Debug>(tx: &Tx, v: T) -> IoFuture<()>
 }
 
 /// Send item to a sink using reference
-pub fn send_all_to<T: Send + 'static, S, Tx, E: Debug>(tx: &Tx, s: S) -> IoFuture<()>
+pub fn send_all_to<T: Send + 'static, S, Tx, E: Debug>(tx: &Tx, s: S) -> impl Future<Item=(), Error=ServerRunError>
     where S: Stream<Item = T, Error = E> + Send + 'static,
           Tx: Sink<SinkItem = T, SinkError = E> + Send + Clone + 'static
 {
-    Box::new(tx
+    tx
         .clone() // clone tx sender for 1 send only
         .send_all(s)
         .map(|_tx| ()) // ignore tx because it was cloned
@@ -41,7 +43,6 @@ pub fn send_all_to<T: Send + 'static, S, Tx, E: Debug>(tx: &Tx, s: S) -> IoFutur
             // This may only happen if rx is gone
             // So cast SendError<T> to a corresponding std::io::Error
             debug!("Send to a sink error {:?}", e);
-            Error::from(ErrorKind::UnexpectedEof)
+            ServerRunError::SendPacketError { error: Error::from(ErrorKind::UnexpectedEof) }
         })
-    )
 }
